@@ -1,7 +1,7 @@
 #define MAX_L1_THREADS (2)
 #define MAX_L2_THREADS (3)
 #define MAX_L3_THREADS (0)
-#define THRESHOLD (3)
+#define THRESHOLD (2)
 #define NONE (255)
 #define UNLOCKED (true)
 #define WAIT (254)
@@ -65,7 +65,7 @@ inline AcquireL3(abortedLevel_Acq_L3) {
     inCS--;};
 }
 
-inline AcquireL2(abortedLevel_Acq_L2) {
+inline AcquireL2(abortedLevel_Acq_L2, waiter_AW_L2) {
     byte prevStatus_Acq_L2;
     byte pred_Acq_L2;
     byte predNext_Acq_L2;
@@ -79,7 +79,12 @@ inline AcquireL2(abortedLevel_Acq_L2) {
       :: prevStatus_Acq_L2 == RECYCLED -> MY_L2_NEXT = NONE; goto USE_QNODE_L2;  // Ready to enqueue
       :: else -> // This lock was abandoned and the pred steped over me, wait till RECYCLED
          /*while(I->status != RECYCLED); No unbounded wait*/
-         CAS(MY_L2_STATUS, WAIT, ACQUIRE_PARENT, tmpStatus_Acq_L2); // Timedout
+         if
+         :: waiter_AW_L2 == true -> MY_L2_STATUS == RECYCLED; tmpStatus_Acq_L2=RECYCLED;
+         :: waiter_AW_L2 == false -> CAS(MY_L2_STATUS, WAIT, ACQUIRE_PARENT, tmpStatus_Acq_L2);
+         fi;
+
+         //CAS(MY_L2_STATUS, WAIT, ACQUIRE_PARENT, tmpStatus_Acq_L2); // Timedout
          if
          :: tmpStatus_Acq_L2 != RECYCLED -> abortedLevel_Acq_L2 = 1 /* L2 */;  // Leaving due to timeout
             goto DONE_ACQUIRE_L2;
@@ -109,25 +114,41 @@ GOT_LOCK_L2:
           L2_STATUS(pred_Acq_L2)= RECYCLED;};
           MY_L2_STATUS = COHORT_START; // Lock is mine, proceed to L3
           AcquireL3(abortedLevel_Acq_L2);
-       :: atomic { else ->
+       :: else ->
 START_SPIN_L2: skip;
-          // Timed out, Start to abandon
-          SWAP(MY_L2_STATUS, prevStatus_Acq_L2 , ABANDONED); };
-          atomic {
-           if
-           :: prevStatus_Acq_L2 < ACQUIRE_PARENT -> MY_L2_STATUS  = prevStatus_Acq_L2 ; goto DONE_ACQUIRE_L2; // got the global lock just in time
-           :: prevStatus_Acq_L2 == ACQUIRE_PARENT -> MY_L2_STATUS  = COHORT_START ; //got a prefix of locks, compete at L3
-           :: else -> abortedLevel_Acq_L2 = 1 /* L2 */; goto DONE_ACQUIRE_L2; // Aborted here (levels are numbered 0, 1, 2, hence this is L2's numerical value is 1)
-           fi
-          };
-          // Compete at the next level (we come here only from prevStatus_Acq_L2 == ACQUIRE_PARENT case
-          AcquireL3(abortedLevel_Acq_L2); 
-       fi
-    fi
+
+          if 
+          ::waiter_AW_L2==true -> 
+            // wait till we get the lock
+            ((MY_L2_STATUS <= ACQUIRE_PARENT));
+            atomic {
+              if
+              :: MY_L2_STATUS < ACQUIRE_PARENT -> goto DONE_ACQUIRE_L2; // got the global lock just in time
+              :: MY_L2_STATUS == ACQUIRE_PARENT -> MY_L2_STATUS  = COHORT_START ; //got a prefix of locks, compete at L3
+              fi
+            };
+            // Compete at the next level (we come here only from prevStatus_Acq_L2 == ACQUIRE_PARENT case
+            AcquireL3(abortedLevel_Acq_L2); 
+          ::waiter_AW_L2==false ->
+            // Timed out, Start to abandon
+            SWAP(MY_L2_STATUS, prevStatus_Acq_L2 , ABANDONED);
+            atomic {
+              if
+              :: prevStatus_Acq_L2 < ACQUIRE_PARENT -> MY_L2_STATUS  = prevStatus_Acq_L2 ; goto DONE_ACQUIRE_L2; // got the global lock just in time
+              :: prevStatus_Acq_L2 == ACQUIRE_PARENT -> MY_L2_STATUS  = COHORT_START ; //got a prefix of locks, compete at L3
+              :: else -> abortedLevel_Acq_L2 = 1 /* L2 */; goto DONE_ACQUIRE_L2; // Aborted here (levels are numbered 0, 1, 2, hence this is L2's numerical value is 1)
+              fi
+            };
+            // Compete at the next level (we come here only from prevStatus_Acq_L2 == ACQUIRE_PARENT case
+            AcquireL3(abortedLevel_Acq_L2); 
+          fi // non-determinism
+       fi // impatient 
+    fi // no pred
+
     DONE_ACQUIRE_L2: skip;
 }
 
-inline AttemptToRelinquishLockL2(me_DWR_L2 /* destroyed */, prev_DWR_L2 /* destroyed and used in caller */){
+inline AttemptToRelinquishLockL2(me_DWR_L2 /* destroyed */, prev_DWR_L2 /* destroyed and used in caller */, waiter_DWR_L2){
     bool retOld_DWR_L2;
     byte tmpStatus_DWR_L2;
     byte tmpSucc_DWR_L2;
@@ -143,7 +164,11 @@ inline AttemptToRelinquishLockL2(me_DWR_L2 /* destroyed */, prev_DWR_L2 /* destr
           :: d_step{ else -> skip; };
           fi
           // Can't wait for next to be updated, attempt to set IMPATIENT
-          BOOL_CAS(L2_NEXT(me_DWR_L2), NONE, IMPATIENT, retOld_DWR_L2); 
+          if
+          :: waiter_DWR_L2 == true -> L2_NEXT(me_DWR_L2) != NONE; retOld_DWR_L2=false;
+          :: waiter_DWR_L2 == false -> BOOL_CAS(L2_NEXT(me_DWR_L2), NONE, IMPATIENT, retOld_DWR_L2); 
+          fi
+          //BOOL_CAS(L2_NEXT(me_DWR_L2), NONE, IMPATIENT, retOld_DWR_L2); 
           if 
           :: d_step{retOld_DWR_L2 == false -> // CAS failed, I have a successor enqueued now.
              // try to pass the lock to the successor
@@ -181,7 +206,7 @@ inline RecyclePredecessorsL2(node_CRC_L2 /* destroyed */, pprev_CRC_L2 /* local 
 }
 
 // Look for an unabandoned successor at L2 to pass the lock
-inline PassToPeerOnReleaseL2(value_HHP_L2 /* const */){
+inline PassToPeerOnReleaseL2(value_HHP_L2 /* const */, waiter_HHP_L2){
     byte prev_HHP_L2 = NONE;
     byte curNode_HHP_L2 = myL2Id;
     byte succTmp_HHP_L2;
@@ -207,7 +232,7 @@ inline PassToPeerOnReleaseL2(value_HHP_L2 /* const */){
         :: else ->  // no known succesor, release L3 lock 
                     ReleaseL3(); 
                     // Relinquish L2 lock
-                    AttemptToRelinquishLockL2(curNode_HHP_L2, prev_HHP_L2); 
+                    AttemptToRelinquishLockL2(curNode_HHP_L2, prev_HHP_L2, waiter_HHP_L2); 
                     break; 
         fi
     od
@@ -229,7 +254,7 @@ inline PassToParentOnTimeoutL3(abortedLevel_HVA_L3) {
 
 
 // Pass the lock prefix to a successor at L2 
-inline PassToPeerOnTimeoutL2(abortedLevel_HHA_L2){
+inline PassToPeerOnTimeoutL2(abortedLevel_HHA_L2, waiter_HHA_L2){
     byte prev_HHA_L2 = NONE;
     byte curNode_HHA_L2 = myL2Id;
     byte prevStatus_HHA_L2;
@@ -254,7 +279,7 @@ inline PassToPeerOnTimeoutL2(abortedLevel_HHA_L2){
        :: else ->  //  no known succesor, go to next level (in this case we will simply come back)
                    PassToParentOnTimeoutL3(abortedLevel_HHA_L2); 
                    // Relinquish L2 lock
-                   AttemptToRelinquishLockL2(curNode_HHA_L2, prev_HHA_L2); 
+                   AttemptToRelinquishLockL2(curNode_HHA_L2, prev_HHA_L2, waiter_HHA_L2); 
                    break;
        fi
     od
@@ -264,15 +289,15 @@ inline PassToPeerOnTimeoutL2(abortedLevel_HHA_L2){
 }
 
 
-inline PassToParentOnTimeoutL2(abortedLevel_HVA_L2) {
+inline PassToParentOnTimeoutL2(abortedLevel_HVA_L2, waiter_HVA_L2) {
     if
     :: d_step {abortedLevel_HVA_L2 == 1 /* L2 */ -> skip;} // if this is the level where we had abandoned, return.
-    :: else -> PassToPeerOnTimeoutL2(abortedLevel_HVA_L2); // Find a waiting successor at L2
+    :: else -> PassToPeerOnTimeoutL2(abortedLevel_HVA_L2, waiter_HVA_L2); // Find a waiting successor at L2
     fi
 }
 
 
-inline ReleaseL2() {
+inline ReleaseL2(waiter_Rel_L2) {
     byte curCount_Rel_L2 = MY_L2_STATUS;
     byte succ_Rel_L2;
     byte prev_Rel_L2 = NONE;
@@ -285,12 +310,12 @@ inline ReleaseL2() {
        // Release L3 lock since we can't keep passing at L2 anymore
        ReleaseL3(); 
        // Relinquish L2 lock
-       AttemptToRelinquishLockL2(copyMyL2Id, prev_Rel_L2);
+       AttemptToRelinquishLockL2(copyMyL2Id, prev_Rel_L2, waiter_Rel_L2);
        //Recycle all L2 nodes on which we had stepped
        RecyclePredecessorsL2(prev_Rel_L2, pprev_tmp1_HHA_L2);
     :: else ->
            // Pass the lock to a L2 peer. 
-           PassToPeerOnReleaseL2(newCurCount_Rel_L2);
+           PassToPeerOnReleaseL2(newCurCount_Rel_L2, waiter_Rel_L2);
     fi
 }
 
@@ -298,13 +323,18 @@ inline ReleaseL2() {
 inline AcquireWrapperL2(acquired_AW_L2) {
     byte abortedLevel_AW_L2 = NONE;
 
-    AcquireL2(abortedLevel_AW_L2);
+    // Non-deterministically decide to wait
+    if
+    ::true-> AcquireL2(abortedLevel_AW_L2, true); assert(abortedLevel_AW_L2==NONE || abortedLevel_AW_L2==2);
+    ::true-> AcquireL2(abortedLevel_AW_L2, false);
+    fi;
+
     if
     :: d_step{ abortedLevel_AW_L2==NONE -> // Successfully acquire, return true
        acquired_AW_L2=true; };
     :: d_step{ else -> /* abandoned */ acquired_AW_L2=false;}; 
        // Release acquired lock prefix
-       PassToParentOnTimeoutL2(abortedLevel_AW_L2); 
+       PassToParentOnTimeoutL2(abortedLevel_AW_L2, false); 
     fi
 }
 
@@ -312,7 +342,7 @@ inline ReleaseL3() {
   skip;
 }
 
-inline AcquireL1(abortedLevel_Acq_L1) {
+inline AcquireL1(abortedLevel_Acq_L1, waiter_AW_L1) {
   byte prevStatus_Acq_L1;
   byte pred_Acq_L1;
   byte predStat_Acq_L1;
@@ -327,8 +357,14 @@ inline AcquireL1(abortedLevel_Acq_L1) {
     :: prevStatus_Acq_L1 == RECYCLED -> MY_L1_NEXT = NONE; goto USE_QNODE_L1; // Ready to enqueue 
     :: else -> 
        // Lock passed after abandonment. Wait till the status becomes RECYCLED
+         if
+         :: waiter_AW_L1 == true -> MY_L1_STATUS == RECYCLED; tmpStatus_Acq_L1=RECYCLED;
+         :: waiter_AW_L1 == false -> CAS(MY_L1_STATUS, WAIT, ACQUIRE_PARENT, tmpStatus_Acq_L1);
+         fi;
+
+
        // Timeout..
-       CAS(MY_L1_STATUS, WAIT, ACQUIRE_PARENT, tmpStatus_Acq_L1);
+       //CAS(MY_L1_STATUS, WAIT, ACQUIRE_PARENT, tmpStatus_Acq_L1);
        if
        :: tmpStatus_Acq_L1 != RECYCLED -> abortedLevel_Acq_L1 = 0 /* L1 */;  // abandoned at L1 (numerically numered as 0)
           goto DONE_ACQUIRE_L1;
@@ -358,7 +394,7 @@ GOT_LOCK_L1:
       inCSL1--;};
 
      // Proceed to acquire L2 lock
-     AcquireL2(abortedLevel_Acq_L1);
+     AcquireL2(abortedLevel_Acq_L1, waiter_AW_L1);
   :: else ->
       // Have a predecessor, swap my id with pred->next
       /* Avoid unbounded wait for I->next */
@@ -375,31 +411,47 @@ GOT_LOCK_L1:
          /* check correctness so that we are the only one from level 1 to have acquired the L1 lock*/
          d_step{ assert(inCSL1 == 1); inCSL1--;};
          // Proceed to acquire L2 lock
-         AcquireL2(abortedLevel_Acq_L1);
-      :: atomic{ else -> 
+         AcquireL2(abortedLevel_Acq_L1, waiter_AW_L1);
+      ::  else -> 
 START_SPIN_L1: skip;
-           // Waited long enough, timeout and  try to abandon
-           SWAP(MY_L1_STATUS, prevStatus_Acq_L1 , ABANDONED); };
-           atomic{
-             if
-             :: prevStatus_Acq_L1 < ACQUIRE_PARENT -> MY_L1_STATUS  = prevStatus_Acq_L1; abortedLevel_Acq_L1 = NONE;  goto DONE_ACQUIRE_L1; // Got the global lock just in time.
-             :: prevStatus_Acq_L1 == ACQUIRE_PARENT -> MY_L1_STATUS  = COHORT_START; /* check correctness */ inCSL1++; // Got only the local lock
-             :: else -> abortedLevel_Acq_L1 = 0 /* L1 */; goto DONE_ACQUIRE_L1; // successfully abandoned at L1
-             fi
-           };
-           /* executed iff prevStatus_Acq_L1 == ACQUIRE_PARENT */
 
-           /* check correctness so that we are the only one from level 1 to have acquired the L1 lock*/
-           d_step{ assert(inCSL1 == 1);  inCSL1--;};
-           // Proceed to acquire L2 lock
-           AcquireL2(abortedLevel_Acq_L1); 
-      fi
-  fi
+           if
+           ::waiter_AW_L1==true -> 
+             ((MY_L1_STATUS <= ACQUIRE_PARENT) ) ;
+             atomic{
+               if
+               :: MY_L1_STATUS < ACQUIRE_PARENT -> abortedLevel_Acq_L1 = NONE;  goto DONE_ACQUIRE_L1; // Got the global lock just in time.
+               :: MY_L1_STATUS == ACQUIRE_PARENT -> MY_L1_STATUS  = COHORT_START; /* check correctness */ inCSL1++; // Got only the local lock
+               fi
+             };
+             /* check correctness so that we are the only one from level 1 to have acquired the L1 lock*/
+             d_step{ assert(inCSL1 == 1);  inCSL1--;};
+             // Proceed to acquire L2 lock
+             AcquireL2(abortedLevel_Acq_L1, waiter_AW_L1); 
+           ::waiter_AW_L1==false-> 
+             // Waited long enough, timeout and  try to abandon
+             SWAP(MY_L1_STATUS, prevStatus_Acq_L1 , ABANDONED); 
+             atomic{
+               if
+               :: prevStatus_Acq_L1 < ACQUIRE_PARENT -> MY_L1_STATUS  = prevStatus_Acq_L1; abortedLevel_Acq_L1 = NONE;  goto DONE_ACQUIRE_L1; // Got the global lock just in time.
+               :: prevStatus_Acq_L1 == ACQUIRE_PARENT -> MY_L1_STATUS  = COHORT_START; /* check correctness */ inCSL1++; // Got only the local lock
+               :: else -> abortedLevel_Acq_L1 = 0 /* L1 */; goto DONE_ACQUIRE_L1; // successfully abandoned at L1
+               fi
+             };
+             /* executed iff prevStatus_Acq_L1 == ACQUIRE_PARENT */
+
+             /* check correctness so that we are the only one from level 1 to have acquired the L1 lock*/
+             d_step{ assert(inCSL1 == 1);  inCSL1--;};
+             // Proceed to acquire L2 lock
+             AcquireL2(abortedLevel_Acq_L1, waiter_AW_L1); 
+           fi // non-determinism
+         fi // Impatient
+       fi // 
   DONE_ACQUIRE_L1: skip;
 }
 
 // Attempts to set L1 lock to null but if it cannot, it tries to pass the L1 lock to a successor.
-inline AttemptToRelinquishLockL1(me_DWR_L1 /* destroyed */, prev_DWR_L1 /* destroyed and used in caller */){
+inline AttemptToRelinquishLockL1(me_DWR_L1 /* destroyed */, prev_DWR_L1 /* destroyed and used in caller */, waiter_DWR_L1){
   bool retOld_DWR_L1;
   byte tmpStatus_DWR_L1;
   byte tmpSucc_DWR_L1;
@@ -415,7 +467,11 @@ inline AttemptToRelinquishLockL1(me_DWR_L1 /* destroyed */, prev_DWR_L1 /* destr
         :: d_step { else -> skip; };
         fi
         // Can't wait for the successor to update next. Leaving impatiently.
-        BOOL_CAS(L1_NEXT(me_DWR_L1), NONE, IMPATIENT, retOld_DWR_L1); 
+        if
+        :: waiter_DWR_L1 == true -> L1_NEXT(me_DWR_L1) != NONE; retOld_DWR_L1=false;
+        :: waiter_DWR_L1 == false -> BOOL_CAS(L1_NEXT(me_DWR_L1), NONE, IMPATIENT, retOld_DWR_L1); 
+        fi
+        //BOOL_CAS(L1_NEXT(me_DWR_L1), NONE, IMPATIENT, retOld_DWR_L1); 
         if 
         :: d_step{retOld_DWR_L1 == false ->
            // Successor updated the next pointer just in time
@@ -453,7 +509,7 @@ inline RecyclePredecessorsL1(node_CRC_L1 /* destroyed */, pprev_CRC_L1 /* local 
 
 
 // Called to release a lock at L1
-inline PassToPeerOnReleaseL1(value_HHP_L1 /* const */){
+inline PassToPeerOnReleaseL1(value_HHP_L1 /* const */, waiter_HHP_L1){
   byte prev_HHP_L1 = NONE;
   byte curNode_HHP_L1 = myL1Id;
   byte succTmp_HHP_L1; 
@@ -476,7 +532,7 @@ inline PassToPeerOnReleaseL1(value_HHP_L1 /* const */){
                 curNode_HHP_L1 = succTmp_HHP_L1;};
           :: atomic{else -> L1_STATUS(curNode_HHP_L1) = RECYCLED; break; };
           fi
-        :: else ->  ReleaseL2(); AttemptToRelinquishLockL1(curNode_HHP_L1, prev_HHP_L1); break; // Lock passed, Recycle the last node.
+        :: else ->  ReleaseL2(waiter_HHP_L1); AttemptToRelinquishLockL1(curNode_HHP_L1, prev_HHP_L1, waiter_HHP_L1); break; // Lock passed, Recycle the last node.
       fi
   od
 
@@ -486,7 +542,7 @@ inline PassToPeerOnReleaseL1(value_HHP_L1 /* const */){
 }
 
 
-inline PassToPeerOnTimeoutL1(abortedLevel_HHA_L1){
+inline PassToPeerOnTimeoutL1(abortedLevel_HHA_L1, waiter_HHA_L1){
   byte prev_HHA_L1 = NONE;
   byte curNode_HHA_L1 = myL1Id;
   byte prevStatus_HHA_L1;
@@ -510,9 +566,9 @@ inline PassToPeerOnTimeoutL1(abortedLevel_HHA_L1){
          fi
       :: else ->
          // no known succesor, release L2 lock
-         PassToParentOnTimeoutL2(abortedLevel_HHA_L1);
+         PassToParentOnTimeoutL2(abortedLevel_HHA_L1, waiter_HHA_L1);
          // Relinquish L1 lock
-         AttemptToRelinquishLockL1(curNode_HHA_L1, prev_HHA_L1); break;
+         AttemptToRelinquishLockL1(curNode_HHA_L1, prev_HHA_L1, waiter_HHA_L1); break;
       fi
   od
 
@@ -521,15 +577,15 @@ inline PassToPeerOnTimeoutL1(abortedLevel_HHA_L1){
   RecyclePredecessorsL1(prev_HHA_L1, pprev_HHA_L1);
 }
 
-inline PassToParentOnTimeoutL1(abortedLevel_HVA_L1) {
+inline PassToParentOnTimeoutL1(abortedLevel_HVA_L1, waiter_HVA_L1) {
   if
   :: d_step{ abortedLevel_HVA_L1 == 0 /* L1 */ -> skip; }; // We abandoned at L1, (numerically number 0), hence nothing to do.
-  :: else -> PassToPeerOnTimeoutL1(abortedLevel_HVA_L1);   // Pass lock prefixes to a L1 peer because we abandoned at a higher level.
+  :: else -> PassToPeerOnTimeoutL1(abortedLevel_HVA_L1, waiter_HVA_L1);   // Pass lock prefixes to a L1 peer because we abandoned at a higher level.
   fi
 }
 
 
-inline ReleaseL1() {
+inline ReleaseL1(waiter_Rel_L1) {
   byte curCount_Rel_L1 = MY_L1_STATUS;
   byte succ_Rel_L1;
   byte prev_Rel_L1 = NONE;
@@ -540,14 +596,14 @@ inline ReleaseL1() {
   if
   :: curCount_Rel_L1 == THRESHOLD ->
         // Reaching the passing threshold at L1, hence release L2 first
-        ReleaseL2();
+        ReleaseL2(waiter_Rel_L1);
         // Relinquish L1
-        AttemptToRelinquishLockL1(copyMyL1Id, prev_Rel_L1);
+        AttemptToRelinquishLockL1(copyMyL1Id, prev_Rel_L1, waiter_Rel_L1);
         //Recycle all L1 nodes on which we had stepped
         RecyclePredecessorsL1(prev_Rel_L1, pprev_tmp1_HHA_L1);
   :: else ->
     // pass the global lock within L1 domain
-    PassToPeerOnReleaseL1(newCurCount_Rel_L1);
+    PassToPeerOnReleaseL1(newCurCount_Rel_L1, waiter_Rel_L1);
   fi
 }
 
@@ -555,13 +611,17 @@ inline ReleaseL1() {
 
 inline AcquireWrapperL1(acquired_AW_L1) {
   byte abortedLevel_AW_L1 = NONE;
-  AcquireL1(abortedLevel_AW_L1);
+  // Non-deterministically decide to wait
+  if
+  ::true->  AcquireL1(abortedLevel_AW_L1, true); assert((abortedLevel_AW_L1==NONE) || (abortedLevel_AW_L1==2));
+  ::true->  AcquireL1(abortedLevel_AW_L1, false);
+  fi;
   if
   :: d_step{abortedLevel_AW_L1==NONE -> // Successfully acquired, return true
         acquired_AW_L1=true;};
   :: d_step{else -> acquired_AW_L1=false;};
      // Timed out at some level. Release acquired locks.
-     PassToParentOnTimeoutL1(abortedLevel_AW_L1);
+     PassToParentOnTimeoutL1(abortedLevel_AW_L1, false /* no wait */);
   fi
 }
 
@@ -571,9 +631,11 @@ inline EnsureAllinRState(){
     byte index;
     for(index: 0..(MAX_L1_THREADS-1)){
       assert(L1_STATUS(index) == RECYCLED);
+      assert(L1_NEXT(index) != IMPATIENT);
     }
     for(index: 0..(MAX_L2_THREADS-1)){
       assert(L2_STATUS(index) == RECYCLED);
+      assert(L2_NEXT(index) != IMPATIENT);
     }
 }
 
@@ -589,8 +651,14 @@ proctype  WorkObserved(int myId) {
   };
 
   AcquireWrapperL1(acquired);
+
   if
-  :: acquired -> ReleaseL1(); // Acquired, now release.
+  :: acquired -> 
+     // Non-deterministically decide to wait
+     if
+     ::true-> ReleaseL1(true); assert(MY_L1_STATUS==RECYCLED);
+     ::true-> ReleaseL1(false);
+     fi;
   :: d_step{else -> skip;}; // Acquisition failed.
   fi
   done++;
@@ -607,9 +675,14 @@ proctype  WorkLevel2(int myId)  {
     myL2Id = MY_L2_NODE_ID(myId);
   };
 
-  AcquireWrapperL2(acquired); 
+  AcquireWrapperL2(acquired);
   if
-  :: acquired -> ReleaseL2();  // Acquired, now release.
+  :: acquired -> 
+     // Non-deterministically decide to wait
+     if
+     ::true-> ReleaseL2(true); assert(MY_L2_STATUS==RECYCLED);
+     ::true-> ReleaseL2(false);
+     fi;
   :: d_step{else -> skip;}; // Acquisition failed.
   fi
   done++;

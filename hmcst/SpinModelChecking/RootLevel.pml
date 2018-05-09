@@ -33,7 +33,7 @@ byte numAcquisitions;
                         }
 
 
-inline Acquire(abandonedNode, myid) {
+inline Acquire(abandonedNode, myid, waiter) {
     byte prevStatus;
     byte pred;
     byte predStat;
@@ -47,7 +47,12 @@ inline Acquire(abandonedNode, myid) {
     :: d_step {prevStatus == WAIT -> skip;};    // Never happens
     :: prevStatus == UNLOCKED ->                 
         /*while(I->status != RECYCLED); No unbounded wait*/
-       CAS(MY_STATUS, WAIT, UNLOCKED, tmpStatus);    // I had abandoned and the pred steped over me, wait till RECYCLED
+       if 
+       :: waiter == true -> MY_STATUS == RECYCLED; tmpStatus=RECYCLED;
+       :: waiter == false -> CAS(MY_STATUS, WAIT, UNLOCKED, tmpStatus); 
+       fi;
+
+       //CAS(MY_STATUS, WAIT, UNLOCKED, tmpStatus);    // I had abandoned and the pred steped over me, wait till RECYCLED
        if
        :: d_step {tmpStatus != RECYCLED -> abandonedNode = myid;}; goto DONE_ACQUIRE; // Leaving due to timeout
        :: d_step {else -> skip; };  // Follow normal enqueue process
@@ -70,14 +75,21 @@ inline Acquire(abandonedNode, myid) {
             :: else -> skip;
             fi
     START_SPIN:
-            if
-            :: d_step {MY_STATUS == UNLOCKED -> abandonedNode = NONE;};  // Got the lock from pred!
-            :: else -> 
-            	SWAP(MY_STATUS, prevStatus , ABANDONED); // Timed out waiting
-                if
-                :: d_step {prevStatus == UNLOCKED -> MY_STATUS = UNLOCKED; abandonedNode = NONE; }; // Got the lock, just in time!
-                :: d_step {else -> abandonedNode = myid;} // Leaving due to timeout
-                fi
+            if 
+            :: waiter == true -> 
+               // wait to get the lock
+               MY_STATUS == UNLOCKED; 
+               abandonedNode = NONE;
+            :: waiter == false -> 
+               if
+               :: d_step {MY_STATUS == UNLOCKED -> abandonedNode = NONE;};  // Got the lock from pred!
+               :: else -> 
+                  SWAP(MY_STATUS, prevStatus , ABANDONED); // Timed out waiting
+                  if
+                  :: d_step {prevStatus == UNLOCKED -> MY_STATUS = UNLOCKED; abandonedNode = NONE; }; // Got the lock, just in time!
+                  :: d_step {else -> abandonedNode = myid;} // Leaving due to timeout
+                  fi
+               fi
             fi
             goto DONE_ACQUIRE;
         :: else -> goto SET_AND_FINISH_ACQUIRE; // No predecessor ==> I own the lock 
@@ -92,9 +104,9 @@ d_step {
 DONE_ACQUIRE: skip;
 }
 
-inline AcquireWrapper(acquired, myid) {
+inline AcquireWrapper(acquired, myid, waiter) {
     byte abandonedNode;
-    Acquire(abandonedNode, myid);
+    Acquire(abandonedNode, myid, waiter);
     if
     :: d_step { abandonedNode==NONE ->  // Acquired! 
        acquired=true;  
@@ -110,7 +122,7 @@ inline AcquireWrapper(acquired, myid) {
 }
 
 
-inline AttemptToRelinquishTheRootLevelLock(me, prev){
+inline AttemptToRelinquishTheRootLevelLock(me, prev, waiter){
     byte tmpStatus;
     byte retOld;
     byte tmpSucc;
@@ -119,10 +131,15 @@ inline AttemptToRelinquishTheRootLevelLock(me, prev){
       // Attempt to set L to NONE
       BOOL_CAS(L, me, NONE, retOld);};        
       if 
-      :: d_step {retOld == false -> 
+      :: retOld == false -> 
          // Failed to set L to NONE, I have a successore
+         if
+         :: waiter == true -> next[me] != NONE; retOld=false;
          // Can't wait for next to be updated, attempt to set IMPATIENT
-         BOOL_CAS(next[me], NONE, IMPATIENT, retOld); };
+         :: waiter == false -> BOOL_CAS(next[me], NONE, IMPATIENT, retOld); 
+         fi
+         //BOOL_CAS(next[me], NONE, IMPATIENT, retOld); 
+         
          if 
          :: d_step { retOld == false ->
             // next got updated just in time
@@ -146,7 +163,7 @@ inline AttemptToRelinquishTheRootLevelLock(me, prev){
      od
 }
 
-inline Release(myid) {
+inline Release(myid, waiter) {
     byte prev = NONE;
     byte me = myid;
     byte succ;
@@ -169,7 +186,7 @@ inline Release(myid) {
           ::  d_step {else -> status[me] = RECYCLED;};  goto CLEANUP; // Lock passed, Recycle the last node.
           fi 
        :: else -> 
-          AttemptToRelinquishTheRootLevelLock(me, prev); // No successor. Attempt to set the lock to NONE.
+          AttemptToRelinquishTheRootLevelLock(me, prev, waiter); // No successor. Attempt to set the lock to NONE.
           goto CLEANUP;
        fi
     od
@@ -192,15 +209,28 @@ proctype  Work(byte myid) {
     bool acquired;
     do
     :: numRounds > 0 -> 
-       AcquireWrapper(acquired, myid); 
        if
-       :: acquired -> Release(myid);
-       :: else -> skip;
-       fi
+       :: true -> AcquireWrapper(acquired, myid, true); 
+                  assert(acquired==true); 
+                  if
+                  :: true -> Release(myid, true);
+                  :: true -> Release(myid, false);
+                  fi
+       :: true->  AcquireWrapper(acquired, myid, false); 
+                  if
+                  :: acquired -> 
+                     if
+                     :: true -> Release(myid, true);
+                     :: true -> Release(myid, false);
+                     fi
+                  :: else -> skip;
+                  fi;
+       fi;
        numRounds--;
     :: else -> break;
     od;    
     done++;
+done == 3;
 }
  
 proctype  WorkObserved(byte myid) { 
@@ -208,15 +238,30 @@ proctype  WorkObserved(byte myid) {
     bool acquired;
     do
     :: numRounds > 0 -> 
-       AcquireWrapper(acquired, myid); 
        if
-       :: acquired -> Release(myid);
-       :: else -> skip;
-       fi
-       numRounds--;
+       :: true -> AcquireWrapper(acquired, myid, true);
+                  assert(acquired==true); 
+                  if
+                  :: true -> Release(myid, true);
+                  :: true -> Release(myid, false);
+                  fi
+ 
+       :: true-> AcquireWrapper(acquired, myid, false);
+                 if
+                 :: acquired -> 
+                    if
+                    :: true -> Release(myid, true);
+                    :: true -> Release(myid, false);
+                    fi
+ 
+                  :: else -> skip;
+                  fi
+      fi;
+      numRounds--;
     :: else -> break;
     od;    
     done++;
+done == 3;
 }
  
 init {
